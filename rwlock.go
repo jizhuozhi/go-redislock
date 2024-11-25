@@ -98,13 +98,15 @@ var runlockScript = newScript(`
     return 1
 `)
 
-var queueRemoveScript = newScript(`
+var notifyAllScript = newScript(`
     local queueKey = KEYS[1]
-    local threadId = ARGV[1]
     
-    local idx = redis.call("LPOS", queueKey, threadId)
-    if idx then
-        redis.call("LREM", queueKey, 1, threadId)
+    local waiters = redis.call("LRANGE", queueKey, 0, -1)
+    if #waiters > 0 then
+        redis.call("DEL", queueKey)
+        for _, waiter in ipairs(waiters) do
+            redis.call("PUBLISH", "notify:"..waiter, "NOTIFIED")
+        end
     end
 `)
 
@@ -132,15 +134,28 @@ func New(client *redis.Client, name string, expiration time.Duration) *Lock {
 
 func (l *Lock) Lock(ctx context.Context) error {
 	threadId := getThreadId(ctx)
-	res, err := wlockScript.exec(ctx, l.client, []string{l.readLockKey, l.readQueueKey, l.writeLockKey, l.writeQueueKey},
-		l.expiration.Milliseconds(), threadId)
-	if err != nil {
-		return err
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		res, err := wlockScript.exec(ctx, l.client, []string{l.readLockKey, l.readQueueKey, l.writeLockKey, l.writeQueueKey},
+			l.expiration.Milliseconds(), threadId)
+		if err != nil {
+			return err
+		}
+		if res == "LOCKED" {
+			return nil
+		}
+		msg, err := l.waitForAcquireLock(ctx, l.writeQueueKey, threadId)
+		if err != nil {
+			return err
+		}
+		if msg == "GRANTED" {
+			return nil
+		}
 	}
-	if res == "LOCKED" {
-		return nil
-	}
-	return l.waitForAcquireLock(ctx, l.writeQueueKey, threadId)
 }
 
 func (l *Lock) Unlock(ctx context.Context) error {
@@ -152,15 +167,28 @@ func (l *Lock) Unlock(ctx context.Context) error {
 
 func (l *Lock) RLock(ctx context.Context) error {
 	threadId := getThreadId(ctx)
-	res, err := rlockScript.exec(ctx, l.client, []string{l.readLockKey, l.readQueueKey, l.writeLockKey, l.writeQueueKey},
-		l.expiration.Milliseconds(), threadId)
-	if err != nil {
-		return err
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		res, err := rlockScript.exec(ctx, l.client, []string{l.readLockKey, l.readQueueKey, l.writeLockKey, l.writeQueueKey},
+			l.expiration.Milliseconds(), threadId)
+		if err != nil {
+			return err
+		}
+		if res == "LOCKED" {
+			return nil
+		}
+		msg, err := l.waitForAcquireLock(ctx, l.readQueueKey, threadId)
+		if err != nil {
+			return err
+		}
+		if msg == "GRANTED" {
+			return nil
+		}
 	}
-	if res == "LOCKED" {
-		return nil
-	}
-	return l.waitForAcquireLock(ctx, l.readQueueKey, threadId)
 }
 
 func (l *Lock) RUnlock(ctx context.Context) error {
@@ -170,7 +198,7 @@ func (l *Lock) RUnlock(ctx context.Context) error {
 	return err
 }
 
-func (l *Lock) waitForAcquireLock(ctx context.Context, queue string, threadId string) error {
+func (l *Lock) waitForAcquireLock(ctx context.Context, queue string, threadId string) (string, error) {
 	key := notifyPrefix + threadId
 	sub := l.client.Subscribe(ctx, key)
 
@@ -181,12 +209,10 @@ func (l *Lock) waitForAcquireLock(ctx context.Context, queue string, threadId st
 	for {
 		select {
 		case msg := <-ch:
-			if msg.Payload == "GRANTED" {
-				return nil
-			}
+			return msg.Payload, nil
 		case <-ctx.Done():
-			_, _ = queueRemoveScript.exec(context.WithoutCancel(ctx), l.client, []string{queue}, threadId)
-			return ctx.Err()
+			_, _ = notifyAllScript.exec(context.WithoutCancel(ctx), l.client, []string{queue})
+			return "", ctx.Err()
 		}
 	}
 }
